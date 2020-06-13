@@ -1,0 +1,166 @@
+#!/sbin/sh
+# An extensible custom Hybris Installer script.
+# https://git.io/fjMH9
+
+# Details about this version:
+#   Device  : %DEVICE%
+#   Release : %VERSION%
+#   Date    : %DATE%
+#   Size    : ~%IMAGE_SIZE%
+
+# >>> TWRP init >>>
+
+OUTFD="/proc/self/fd/$2" # e.g. "/proc/self/fd/28"
+ZIPFILE="$3"             # e.g. "/sdcard/%DST_PKG%.zip"
+FILES="/tmp/hybris-installer"
+
+# Set progress bar percentage using a fraction ($1) in range 0.00 - 1.00
+set_progress() { echo -e "set_progress $1\n" > $OUTFD; }
+
+# Print some text ($1) on the screen
+ui_print() { [ -z "$1" ] && echo -e "ui_print  \nui_print" > $OUTFD || echo -e "ui_print $@\nui_print" > $OUTFD; }
+
+# Log some text ($1) for script debugging
+log() { echo "hybris-installer: $@"; }
+
+# Remove package residue files from /tmp and unmount partitions
+cleanup() { log "Cleaning up..."; umount /system_root; rm -rf $FILES/; }
+
+# Before quitting with an exit code ($1), show a message ($2)
+abort() { ui_print "E$1: $2"; cleanup; exit $1; }
+
+# <<< TWRP init <<<
+
+# >>> Custom functions >>>
+
+# Verify device boardname validity (e.g. not unset, no spaces / uppercase chars)
+invalid_device() { [[ -z "$CURRENT_DEVICE" || "$CURRENT_DEVICE" = *" "* || `echo "$CURRENT_DEVICE" | grep -q [A-Z]` ]]; }
+
+# <<< Custom functions <<<
+
+# Constants & variables
+VERSION="%VERSION%" # e.g. "3.2.0.12 (Torronsuo)"
+TARGET_LOS_VER="%LOS_VER%" # e.g. "16.0"
+TARGET_DEVICE="%DEVICE%" # e.g. "cheeseburger"
+CURRENT_DEVICE=`getprop ro.omni.device`
+ROOT="/data/.stowaways/sailfishos"
+FORCE_REINSTALL=0
+
+# >>> Sanity checks >>>
+
+# Device
+invalid_device && CURRENT_DEVICE=`getprop ro.product.device`
+invalid_device && CURRENT_DEVICE=`getprop ro.build.product`
+[ "$CURRENT_DEVICE" != "$TARGET_DEVICE" ] && abort 7 "This package is for '$TARGET_DEVICE' devices; this is a '$CURRENT_DEVICE'."
+
+# TODO: Understand which recovery the user is using, so we can properly
+#       describing the steps of how to "Format"
+if [ -e /dev/block/dm-0 ]; then
+	ui_print "--------"
+	ui_print "Ooops, your device is encrypted!"
+	ui_print
+	ui_print "SailfishOS does not support full disk encryption."
+	ui_print "However, support for /home encryption is available."
+	ui_print
+	ui_print "Please format userdata by"
+	ui_print "Go to 'Wipe > Format Data' from TWRP, you'll lose all your data."
+	ui_print
+	ui_print "After done, reboot and run this ZIP again."
+	ui_print
+	ui_print "We're sorry for the inconvenience."
+	ui_print "--------"
+	abort 6
+fi
+
+# ext4 check for /data (& /cache)
+(mount | grep -q /cache || mount /cache) &&
+	(mount | grep -q "/cache.*ext4" || abort 1 "Cache is NOT formatted as ext4; check out 'Wipe > Advanced' from TWRP!") ||
+	log "Couldn't mount /cache! Is this an A/B device by any chance?"
+(mount | grep -q /data || mount /data) || abort 2 "Couldn't mount /data; running e2fsck and rebooting may help."
+mount | grep -q "/data.*ext4" || abort 3 "Data is NOT formatted as ext4; check out 'Wipe > Advanced' from TWRP!"
+
+# Treble
+[ -r /dev/block/bootdevice/by-name/vendor ] || abort 4 "A vendor partition doesn't exist; Please ask for support in our chat rooms!"
+
+# Android
+(mount | grep -q /system_root || mount /system_root) || abort 5 "Couldn't mount /system! Try format /system and try again."
+if [ `cat /system/build.prop | grep lineage.build.version= | cut -d'=' -f2` != "$TARGET_LOS_VER" ]; then
+	if [ ! -f /tmp/sfos_flash_confirm ]; then
+		touch /tmp/sfos_flash_confirm
+		abort 6 "If you don't know what you're doing: please factory reset & dirty flash LineageOS $TARGET_LOS_VER before this zip. Otherwise reflash again to confirm force flashing of SFOS."
+	fi
+	log "About to perform forced flash of SFOS"
+fi
+if [ -f $ROOT/etc/os-release ]; then
+	if [ ! -f /tmp/sfos_fresh_confirm ]; then
+		touch /tmp/sfos_fresh_confirm
+		abort 9 "This zip is NOT an OTA and should not be treated like one. Please reflash once more to confirm a full SFOS reinstall!"
+	fi
+	FORCE_REINSTALL=1
+fi
+rm -f /tmp/sfos_f{la,re}sh_confirm
+
+# <<< Sanity checks <<<
+
+# >>> Script >>>
+
+# Reset shown progress bar to 0%
+set_progress 0
+
+# Calculate centering offset indent on left
+offset=`echo -n $VERSION | wc -m` # Character length of the version string
+offset=`expr 52 - 23 - $offset`   # Remove constant string chars from offset calculation
+offset=`expr $offset / 2`         # Get left offset char count instead of space on both sides
+
+# Build the left side indentation offset string
+for i in `seq 1 $offset`; do indent="${indent} "; done
+
+# Splash
+ui_print
+ui_print "Installing Sailfish OS $VERSION"
+ui_print
+ui_print "Support can be asked here:"
+ui_print " * Discord: https://discord.gg/AvtdRJ3"
+ui_print " * Matrix: #danctnix-portingv2:matrix.org"
+ui_print
+
+# Start
+log "----- START INSTALL SAILFISHOS $VERSION -----"
+log "Extracting package '$ZIPFILE'..."
+mkdir -p $FILES/
+unzip -o "$ZIPFILE" -x META-INF/* -d $FILES/
+
+log "Patching TWRP's broken tar..."
+(cp -f $FILES/tar /sbin/tar && chmod 777 /sbin/tar) || abort 8 "Couldn't patch tar!"
+
+log "Extracting SFOS rootfs..."
+ARCHIVE="$FILES/sfos-rootfs.tar.bz2"
+rm -rf $ROOT/
+mkdir -p $ROOT/
+tar -xj -f $ARCHIVE -C $ROOT/ || abort 10 "Couldn't extract SFOS rootfs!"
+rm $ARCHIVE
+
+log "Fixing up init scripts..."
+sed -e "/extraenv/s/^/#/g" -e "/import \/init.\${ro.hardware}.rc/s/^/#/" -e "/ro.zygote/s/^/#/g" -e "/start update_verifier/s/^/#/g" \
+    -e "s/\/cpus\ /\/cpuset.cpus /g" -e "s/\/cpus$/\/cpuset.cpus/g" -e "s/\/mems\ /\/cpuset.mems /g" -e "s/\/mems$/\/cpuset.mems/g" \
+    -i $ROOT/init.rc || log "Couldn't fix-up init script!"
+rm $ROOT/init.extraenv.armeabi-v7a.rc
+
+log "Disabling forced encryption in vendor fstab..."
+(umount /vendor &> /dev/null; mount -o rw /vendor && sed "s/fileencryption/encryptable/" -i /vendor/etc/fstab.qcom && sed "s/forceencrypt/encryptable/" -i /vendor/etc/fstab.qcom) || log "Couldn't disable forced encryption!"
+umount /vendor &
+
+log "Writing hybris-boot image..."
+dd if=$ROOT/boot/hybris-boot.img of=/dev/block/bootdevice/by-name/boot || abort 11 "Couldn't write Hybris boot image!"
+
+# <<< Script <<<
+
+# Succeeded.
+ui_print "Sailfish OS installed successfully."
+ui_print "Please reboot your device and enjoY!"
+ui_print
+ui_print "Keep in mind that support is provided on our chat rooms."
+ui_print "Thanks."
+cleanup
+log "----- END SAILFISHOS $VERSION INSTALL -----"
+exit 0
